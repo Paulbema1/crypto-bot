@@ -2,63 +2,121 @@ import os
 import time
 import threading
 import requests
+import json
 from flask import Flask
 
-# --- CONFIGURATION FLASK (POUR RENDER) ---
+# --- 1. CONFIGURATION DU SERVEUR WEB (OBLIGATOIRE POUR RENDER) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot en ligne 24/7"
+    return "🚀 Bot Crypto Actif 24/7"
 
 def run_web_server():
-    # Render donne un port spécifique via la variable d'environnement PORT
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
-# --- LE CERVEAU DU BOT ---
-def bot_logic():
-    print("🤖 Démarrage du Bot...")
-    
-    # Vérification des clés
-    openai_key = os.environ.get('OPENAI_KEY')
-    tg_token = os.environ.get('TG_TOKEN')
-    tg_chat_id = os.environ.get('TG_CHAT_ID')
+# --- 2. FONCTIONS DE TRADING ---
+def send_telegram(message):
+    try:
+        token = os.environ.get('TG_TOKEN')
+        chat_id = os.environ.get('TG_CHAT_ID')
+        if token and chat_id:
+            url = f"https://api.telegram.org/bot{token}/sendMessage"
+            requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"})
+            print("✅ Message Telegram envoyé.")
+        else:
+            print("❌ Erreur: Clés Telegram manquantes.")
+    except Exception as e:
+        print(f"❌ Erreur envoi Telegram: {e}")
 
-    if not all([openai_key, tg_token, tg_chat_id]):
-        print("❌ ERREUR : Il manque des clés (Variables d'environnement)")
+def analyze_market():
+    print("🔍 Analyse du marché en cours...")
+    
+    # Récupérer les clés
+    openai_key = os.environ.get('OPENAI_KEY')
+    if not openai_key:
+        print("❌ Erreur: Clé OpenAI manquante.")
         return
 
-    while True:
-        try:
-            print("🔍 Analyse du marché...")
-            
-            # 1. Récupérer prix BTC
-            url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=5"
-            resp = requests.get(url).json()
-            last_close = float(resp[-1][4])
-            
-            # 2. Demander à GPT (Simulation pour l'exemple, remplace par ton code complet)
-            # Pour économiser tes crédits OpenAI pendant les tests, je mets une logique simple ici
-            # Mais tu remettras ton appel OpenAI ici
-            
-            print(f"Prix actuel: {last_close}$")
-            
-            # Ici, tu insères ton appel OpenAI requests.post(...)
-            # Si signal détecté -> send_telegram(...)
-            
-        except Exception as e:
-            print(f"Erreur : {e}")
+    try:
+        # A. Récupérer données Binance (BTCUSDT)
+        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=10"
+        response = requests.get(url)
+        data = response.json()
         
-        # Pause de 10 minutes
-        print("💤 Pause de 10 minutes...")
-        time.sleep(600)
+        # On garde les prix de fermeture des 5 dernières bougies
+        closes = [float(candle[4]) for candle in data[-5:]]
+        current_price = closes[-1]
+        
+        print(f"💰 Prix BTC: {current_price} $")
 
-# --- LANCEMENT ---
+        # B. Demander à l'IA
+        prompt = f"""
+        Agis comme un expert trader. Analyse ces 5 derniers prix de clôture BTC (15m): {closes}.
+        Prix actuel: {current_price}.
+        Détecte une tendance ou un setup.
+        
+        RÈGLE STRICTE : Réponds UNIQUEMENT avec ce JSON (pas de texte avant/après):
+        {{
+            "action": "ACHAT" ou "VENTE" ou "ATTENTE",
+            "confidence": un nombre entre 0 et 100,
+            "tp": "prix take profit",
+            "sl": "prix stop loss",
+            "reason": "phrase courte en français"
+        }}
+        """
+
+        ai_resp = requests.post(
+            'https://api.openai.com/v1/chat/completions',
+            headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {openai_key}'},
+            json={
+                "model": "gpt-3.5-turbo",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.5
+            }
+        )
+
+        if ai_resp.status_code != 200:
+            print(f"❌ Erreur OpenAI: {ai_resp.text}")
+            return
+
+        result_text = ai_resp.json()['choices'][0]['message']['content']
+        signal = json.loads(result_text)
+        
+        print(f"🤖 IA: {signal['action']} ({signal['confidence']}%)")
+
+        # C. Envoyer alerte si signal intéressant
+        if signal['action'] != "ATTENTE" and signal['confidence'] > 75:
+            emoji = "🟢" if signal['action'] == "ACHAT" else "🔴"
+            msg = f"""
+{emoji} *SIGNAL {signal['action']}*
+----------------
+💵 Prix: {current_price} $
+🎯 TP: {signal['tp']}
+🛑 SL: {signal['sl']}
+📊 Confiance: {signal['confidence']}%
+----------------
+💡 _{signal['reason']}_
+            """
+            send_telegram(msg)
+        else:
+            print("💤 Pas de signal fort pour l'instant.")
+
+    except Exception as e:
+        print(f"❌ Erreur Analyse: {e}")
+
+# --- 3. BOUCLE PRINCIPALE ---
+def bot_loop():
+    while True:
+        analyze_market()
+        print("⏳ Pause de 10 minutes...")
+        time.sleep(600) # 600 secondes = 10 minutes
+
 if __name__ == "__main__":
-    # Lancer le bot dans un fil séparé (background)
-    t = threading.Thread(target=bot_logic)
+    # Lancer le bot en arrière-plan
+    t = threading.Thread(target=bot_loop)
     t.start()
     
-    # Lancer le serveur web (bloquant, pour que Render soit content)
+    # Lancer le serveur web pour Render
     run_web_server()
