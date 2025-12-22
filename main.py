@@ -3,120 +3,142 @@ import time
 import threading
 import requests
 import json
+import telebot
 from flask import Flask
 
-# --- 1. CONFIGURATION DU SERVEUR WEB (OBLIGATOIRE POUR RENDER) ---
+# --- CONFIGURATION ---
+OPENAI_KEY = os.environ.get('OPENAI_KEY')
+TG_TOKEN = os.environ.get('TG_TOKEN')
+TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
+
 app = Flask(__name__)
+bot = telebot.TeleBot(TG_TOKEN)
 
-@app.route('/')
-def home():
-    return "🚀 Bot Crypto Actif 24/7"
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
-
-# --- 2. FONCTIONS DE TRADING ---
-def send_telegram(message):
+# --- 1. FONCTIONS UTILES (Réutilisables) ---
+def get_btc_data():
     try:
-        token = os.environ.get('TG_TOKEN')
-        chat_id = os.environ.get('TG_CHAT_ID')
-        if token and chat_id:
-            url = f"https://api.telegram.org/bot{token}/sendMessage"
-            requests.post(url, json={"chat_id": chat_id, "text": message, "parse_mode": "Markdown"})
-            print("✅ Message Telegram envoyé.")
-        else:
-            print("❌ Erreur: Clés Telegram manquantes.")
-    except Exception as e:
-        print(f"❌ Erreur envoi Telegram: {e}")
-
-def analyze_market():
-    print("🔍 Analyse du marché en cours...")
-    
-    # Récupérer les clés
-    openai_key = os.environ.get('OPENAI_KEY')
-    if not openai_key:
-        print("❌ Erreur: Clé OpenAI manquante.")
-        return
-
-    try:
-        # A. Récupérer données Binance (BTCUSDT)
         url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=10"
-        response = requests.get(url)
-        data = response.json()
-        
-        # On garde les prix de fermeture des 5 dernières bougies
-        closes = [float(candle[4]) for candle in data[-5:]]
-        current_price = closes[-1]
-        
-        print(f"💰 Prix BTC: {current_price} $")
+        resp = requests.get(url).json()
+        closes = [float(c[4]) for c in resp]
+        return closes
+    except:
+        return None
 
-        # B. Demander à l'IA
-        prompt = f"""
-        Agis comme un expert trader. Analyse ces 5 derniers prix de clôture BTC (15m): {closes}.
-        Prix actuel: {current_price}.
-        Détecte une tendance ou un setup.
-        
-        RÈGLE STRICTE : Réponds UNIQUEMENT avec ce JSON (pas de texte avant/après):
-        {{
-            "action": "ACHAT" ou "VENTE" ou "ATTENTE",
-            "confidence": un nombre entre 0 et 100,
-            "tp": "prix take profit",
-            "sl": "prix stop loss",
-            "reason": "phrase courte en français"
-        }}
-        """
-
-        ai_resp = requests.post(
+def ask_gpt(prompt):
+    try:
+        resp = requests.post(
             'https://api.openai.com/v1/chat/completions',
-            headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {openai_key}'},
+            headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {OPENAI_KEY}'},
             json={
                 "model": "gpt-3.5-turbo",
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.5
+                "temperature": 0.7
             }
         )
-
-        if ai_resp.status_code != 200:
-            print(f"❌ Erreur OpenAI: {ai_resp.text}")
-            return
-
-        result_text = ai_resp.json()['choices'][0]['message']['content']
-        signal = json.loads(result_text)
-        
-        print(f"🤖 IA: {signal['action']} ({signal['confidence']}%)")
-
-        # C. Envoyer alerte si signal intéressant
-        if signal['action'] != "ATTENTE" and signal['confidence'] > 75:
-            emoji = "🟢" if signal['action'] == "ACHAT" else "🔴"
-            msg = f"""
-{emoji} *SIGNAL {signal['action']}*
-----------------
-💵 Prix: {current_price} $
-🎯 TP: {signal['tp']}
-🛑 SL: {signal['sl']}
-📊 Confiance: {signal['confidence']}%
-----------------
-💡 _{signal['reason']}_
-            """
-            send_telegram(msg)
-        else:
-            print("💤 Pas de signal fort pour l'instant.")
-
+        return resp.json()['choices'][0]['message']['content']
     except Exception as e:
-        print(f"❌ Erreur Analyse: {e}")
+        return f"Erreur IA: {e}"
 
-# --- 3. BOUCLE PRINCIPALE ---
-def bot_loop():
+# --- 2. COMMANDES TELEGRAM (INTERACTION) ---
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    bot.reply_to(message, "👋 Salut ! Je suis ton Bot Crypto.\n\nCommandes dispo:\n/prix - Prix BTC actuel\n/analyse - Lancer l'IA maintenant\nOu pose-moi une question directement !")
+
+@bot.message_handler(commands=['prix'])
+def send_price(message):
+    data = get_btc_data()
+    if data:
+        price = data[-1]
+        bot.reply_to(message, f"💰 BTC/USD : {price} $")
+    else:
+        bot.reply_to(message, "❌ Erreur Binance")
+
+@bot.message_handler(commands=['analyse'])
+def force_analyze(message):
+    bot.reply_to(message, "🔍 Je lance l'analyse, patiente quelques secondes...")
+    # On appelle la fonction d'analyse (définie plus bas)
+    analyze_market(manual_trigger=True, chat_target=message.chat.id)
+
+# Répondre aux questions libres (Chat avec GPT)
+@bot.message_handler(func=lambda message: True)
+def echo_all(message):
+    user_msg = message.text
+    # Petit message d'attente
+    wait_msg = bot.reply_to(message, "🤔 Je réfléchis...")
+    
+    # Demander à GPT
+    ai_reply = ask_gpt(f"Tu es un expert crypto. Réponds court : {user_msg}")
+    
+    # Modifier le message d'attente avec la réponse
+    bot.edit_message_text(chat_id=message.chat.id, message_id=wait_msg.message_id, text=ai_reply)
+
+# --- 3. ANALYSE AUTOMATIQUE ---
+def analyze_market(manual_trigger=False, chat_target=None):
+    # Si c'est manuel, on envoie la réponse à celui qui a demandé
+    # Si c'est auto, on envoie au canal par défaut
+    target_id = chat_target if manual_trigger else TG_CHAT_ID
+    
+    closes = get_btc_data()
+    if not closes: return
+
+    current_price = closes[-1]
+    
+    # Prompt IA pour analyse technique
+    prompt = f"""
+    Analyse technique BTC (15m). Clôtures: {closes[-5:]}.
+    Prix: {current_price}.
+    JSON strict : {{"action": "ACHAT/VENTE/ATTENTE", "conf": %, "raison": "courte"}}
+    """
+    
+    raw_res = ask_gpt(prompt)
+    
+    try:
+        signal = json.loads(raw_res)
+        
+        # Envoi du résultat
+        if manual_trigger:
+            # En manuel, on envoie TOUJOURS le résultat
+            bot.send_message(target_id, f"🤖 *Analyse Manuelle*\nAction: {signal['action']}\nConfiance: {signal['conf']}%\nRaison: {signal['raison']}", parse_mode="Markdown")
+        
+        elif signal['action'] != "ATTENTE" and signal['conf'] > 75:
+            # En auto, seulement si signal fort
+            emoji = "🟢" if "ACHAT" in signal['action'] else "🔴"
+            bot.send_message(target_id, f"{emoji} *ALERTE {signal['action']}*\nPrix: {current_price}\nConf: {signal['conf']}%\n{signal['raison']}", parse_mode="Markdown")
+        else:
+            print("Auto: Pas de signal fort.")
+            
+    except:
+        if manual_trigger:
+            bot.send_message(target_id, f"Brut: {raw_res}")
+
+# --- 4. SERVER & THREADS ---
+@app.route('/')
+def home():
+    return "🤖 Bot Interactif En Ligne"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+def run_auto_loop():
     while True:
-        analyze_market()
-        print("⏳ Pause de 10 minutes...")
-        time.sleep(600) # 600 secondes = 10 minutes
+        print("⏰ Scan auto...")
+        analyze_market() # Appel automatique
+        time.sleep(600)
+
+def run_telegram_bot():
+    # Enlève les anciens webhooks pour éviter les conflits
+    bot.remove_webhook()
+    # Lance l'écoute
+    bot.infinity_polling()
 
 if __name__ == "__main__":
-    # Lancer le bot en arrière-plan
-    t = threading.Thread(target=bot_loop)
-    t.start()
+    # Thread 1: Analyse Auto
+    threading.Thread(target=run_auto_loop).start()
     
-    # Lancer le serveur web pour Render
-    run_web_server()
+    # Thread 2: Écoute Telegram (Interaction)
+    threading.Thread(target=run_telegram_bot).start()
+    
+    # Main: Serveur Web (Pour Render)
+    run_flask()
