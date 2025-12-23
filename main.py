@@ -4,15 +4,19 @@ import threading
 import requests
 import json
 import telebot
+import sys
 import google.generativeai as genai
 from flask import Flask
+
+# --- FORCE L'AFFICHAGE DES LOGS ---
+sys.stdout.reconfigure(encoding='utf-8')
 
 # --- CONFIGURATION ---
 GEMINI_KEY = os.environ.get('GEMINI_KEY')
 TG_TOKEN = os.environ.get('TG_TOKEN')
 TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
 
-# Configuration de l'IA
+# Config Gemini
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
@@ -22,53 +26,68 @@ bot = telebot.TeleBot(TG_TOKEN)
 # --- OUTILS ---
 
 def get_btc_data():
-    """Récupère le prix BTC sur Binance"""
     try:
         url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=10"
         resp = requests.get(url, timeout=10).json()
         closes = [float(c[4]) for c in resp]
         return closes
-    except:
+    except Exception as e:
+        print(f"Erreur Binance: {e}", flush=True)
         return None
 
 def ask_gemini(prompt):
-    """Interroge Google Gemini"""
     try:
-        if not GEMINI_KEY: return "❌ Erreur: Clé GEMINI manquante."
-        
-        # Le modèle Flash est rapide et gratuit
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # ICI LE CHANGEMENT : On utilise 'gemini-pro' qui est 100% compatible
+        model = genai.GenerativeModel('gemini-pro')
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
-        return f"Erreur IA: {e}"
+        print(f"Erreur Gemini: {e}", flush=True)
+        return "Désolé, une erreur IA est survenue."
 
-# --- TELEGRAM ---
+# --- TELEGRAM (COMMANDES) ---
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
-    bot.reply_to(message, "👋 Bot Crypto (Gemini) Prêt !\n/prix - Prix actuel\n/analyse - Avis IA")
+    welcome_msg = (
+        "👋 **Salut ! Je suis ton Assistant Crypto.**\n\n"
+        "💰 /prix - Voir le prix du Bitcoin\n"
+        "🧠 /analyse - Analyse technique\n"
+        "💬 *Tu peux aussi me parler normalement !*"
+    )
+    bot.reply_to(message, welcome_msg, parse_mode="Markdown")
 
 @bot.message_handler(commands=['prix'])
 def send_price(message):
     data = get_btc_data()
     if data:
-        bot.reply_to(message, f"💰 BTC : {data[-1]} $")
+        bot.reply_to(message, f"💰 **Bitcoin (BTC)** : {data[-1]} $", parse_mode="Markdown")
     else:
-        bot.reply_to(message, "❌ Erreur Binance")
+        bot.reply_to(message, "❌ Impossible de joindre Binance.")
 
 @bot.message_handler(commands=['analyse'])
 def force_analyze(message):
-    bot.reply_to(message, "⚡ Analyse Gemini Flash en cours...")
+    bot.send_chat_action(message.chat.id, 'typing')
+    bot.reply_to(message, "🧐 Analyse Gemini Pro en cours...")
     analyze_market(manual_trigger=True, chat_target=message.chat.id)
 
-@bot.message_handler(func=lambda message: True)
-def echo_all(message):
-    bot.send_chat_action(message.chat.id, 'typing')
-    reply = ask_gemini(f"Tu es un expert crypto. Réponds court : {message.text}")
-    bot.reply_to(message, reply)
+# --- DISCUSSION LIBRE ---
 
-# --- CŒUR DE L'ANALYSE ---
+@bot.message_handler(func=lambda message: True)
+def chat_with_ai(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    
+    # Prompt pour lui donner une personnalité
+    system_prompt = (
+        "Tu es un assistant expert en crypto-trading et un ami sympa. "
+        "Réponds de manière concise et utile. "
+        f"\nQuestion utilisateur : {message.text}"
+    )
+    
+    reply = ask_gemini(system_prompt)
+    bot.reply_to(message, reply) # On envoie en texte normal pour éviter les bugs Markdown
+
+# --- ANALYSE AUTOMATIQUE ---
 
 def analyze_market(manual_trigger=False, chat_target=None):
     target_id = chat_target if manual_trigger else TG_CHAT_ID
@@ -78,51 +97,52 @@ def analyze_market(manual_trigger=False, chat_target=None):
     current_price = closes[-1]
     
     prompt = f"""
-    Agis comme un trader expert. Analyse ces clôtures BTC (15m): {closes[-5:]}.
+    Agis comme un analyste pro. Analyse ces clôtures BTC (15m): {closes[-5:]}.
     Prix actuel: {current_price}.
     
-    Réponds UNIQUEMENT avec ce JSON strict (pas de markdown):
+    Donne-moi UNIQUEMENT ce JSON strict :
     {{
         "action": "ACHAT" ou "VENTE" ou "ATTENTE",
         "conf": 85,
-        "raison": "Phrase courte en français"
+        "raison": "Une phrase courte d'analyse."
     }}
     """
     
     raw_res = ask_gemini(prompt)
-    # Nettoyage vital pour éviter les erreurs JSON
     clean_res = raw_res.replace('```json', '').replace('```', '').strip()
 
     try:
         signal = json.loads(clean_res)
         
         if manual_trigger:
-            msg = f"🤖 *Analyse*\nAction: {signal['action']}\nConfiance: {signal['conf']}%\nRaison: {signal['raison']}"
+            msg = f"📊 **ANALYSE**\n\n🔹 Action: **{signal['action']}**\n🔹 Confiance: `{signal['conf']}%`\n💡 *{signal['raison']}*"
             bot.send_message(target_id, msg, parse_mode="Markdown")
         
         elif signal['action'] != "ATTENTE" and signal['conf'] > 80:
             emoji = "🟢" if "ACHAT" in signal['action'] else "🔴"
-            msg = f"{emoji} *ALERTE {signal['action']}*\nPrix: {current_price}\nConf: {signal['conf']}%\n{signal['raison']}"
+            msg = f"{emoji} **SIGNAL {signal['action']}**\n\n💵 Prix: `{current_price}$`\n🧠 Confiance: `{signal['conf']}%`\n\n📝 _{signal['raison']}_"
             bot.send_message(target_id, msg, parse_mode="Markdown")
             
-    except:
-        if manual_trigger: bot.send_message(target_id, f"Réponse brute: {clean_res}")
+    except Exception as e:
+        if manual_trigger: 
+            bot.send_message(target_id, f"Réponse brute IA (Erreur JSON): {clean_res}")
 
 # --- LANCEMENT ---
 
 @app.route('/')
-def home(): return "Bot en ligne"
+def home(): return "Bot En Ligne"
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 def run_auto_loop():
     while True:
-        analyze_market()
-        time.sleep(600)
+        try:
+            analyze_market()
+            time.sleep(600)
+        except: time.sleep(60)
 
 def run_bot_safe():
-    # Suppression du webhook pour éviter l'erreur 409
     try:
         bot.remove_webhook()
         time.sleep(1)
@@ -130,11 +150,16 @@ def run_bot_safe():
     
     while True:
         try:
+            print("🎧 Bot prêt...", flush=True)
             bot.infinity_polling(timeout=20, long_polling_timeout=5)
         except:
             time.sleep(5)
 
 if __name__ == "__main__":
-    threading.Thread(target=run_auto_loop).start()
-    threading.Thread(target=run_bot_safe).start()
+    t1 = threading.Thread(target=run_auto_loop)
+    t1.start()
+    
+    t2 = threading.Thread(target=run_bot_safe)
+    t2.start()
+    
     run_flask()
