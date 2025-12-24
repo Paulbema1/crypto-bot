@@ -15,7 +15,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 TG_TOKEN = os.environ.get('TG_TOKEN')
 TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
-# Permet de changer de modèle sans toucher au code
+# Modèle par défaut (Llama 3.3 est le plus stable actuellement)
 MODEL_NAME = os.environ.get('MODEL_NAME', 'llama-3.3-70b-versatile')
 
 # Initialisation Groq
@@ -25,29 +25,35 @@ client = Groq(api_key=GROQ_API_KEY)
 app = Flask(__name__)
 bot = telebot.TeleBot(TG_TOKEN)
 
-# --- OUTILS DE RÉCUPÉRATION ---
+# --- OUTILS DE RÉCUPÉRATION DE PRIX ---
 
 def get_btc_data():
-    """Récupère les dernières bougies 15m du Bitcoin sur Binance."""
+    """Récupère le prix SPOT réel du Bitcoin sur Binance."""
     try:
-        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=10"
-        resp = requests.get(url, timeout=10).json()
-        closes = [float(c[4]) for c in resp]
+        # 1. On récupère le prix exact à la seconde près
+        price_url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
+        price_resp = requests.get(price_url, timeout=10).json()
+        current_price = float(price_resp['price'])
+        
+        # 2. On récupère l'historique récent pour l'analyse
+        klines_url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=10"
+        klines_resp = requests.get(klines_url, timeout=10).json()
+        closes = [float(c[4]) for c in klines_resp]
+        
+        # On remplace la dernière clôture par le prix exact en direct
+        closes[-1] = current_price
+        
+        print(f"DEBUG: Prix BTC récupéré : {current_price}", flush=True)
         return closes
     except Exception as e:
         print(f"Erreur Binance: {e}", flush=True)
         return None
 
 def ask_ai(prompt):
-    """Envoie une requête à Groq avec le modèle choisi."""
+    """Envoie une requête à Groq."""
     try:
         chat_completion = client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
+            messages=[{"role": "user", "content": prompt}],
             model=MODEL_NAME,
         )
         return chat_completion.choices[0].message.content
@@ -60,10 +66,10 @@ def ask_ai(prompt):
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     welcome_msg = (
-        "👋 **Salut ! Je suis ton Assistant Crypto.**\n\n"
-        "💰 /prix - Voir le prix actuel du Bitcoin\n"
-        "🧠 /analyse - Lancer une analyse technique\n"
-        "💬 *Tu peux aussi me poser des questions sur la crypto !*"
+        "👋 **Bot Assistant Crypto Connecté !**\n\n"
+        "💰 /prix - Voir le prix réel (Binance Spot)\n"
+        "🧠 /analyse - Analyse technique (Llama 3.3)\n"
+        "💬 *Pose-moi n'importe quelle question sur le trading.*"
     )
     bot.reply_to(message, welcome_msg, parse_mode="Markdown")
 
@@ -71,14 +77,15 @@ def send_welcome(message):
 def send_price(message):
     data = get_btc_data()
     if data:
-        bot.reply_to(message, f"💰 **Bitcoin (BTC)** : `{data[-1]} $`", parse_mode="Markdown")
+        price = data[-1]
+        bot.reply_to(message, f"💰 **Bitcoin (BTC)** : `{price:,} $`", parse_mode="Markdown")
     else:
-        bot.reply_to(message, "❌ Impossible de contacter Binance.")
+        bot.reply_to(message, "❌ Erreur de connexion Binance.")
 
 @bot.message_handler(commands=['analyse'])
 def force_analyze(message):
     bot.send_chat_action(message.chat.id, 'typing')
-    bot.reply_to(message, f"🧐 Analyse en cours ({MODEL_NAME})...")
+    bot.reply_to(message, "🧐 Analyse du marché en cours...")
     analyze_market(manual_trigger=True, chat_target=message.chat.id)
 
 # --- CHAT LIBRE ---
@@ -88,9 +95,9 @@ def chat_with_ai(message):
     bot.send_chat_action(message.chat.id, 'typing')
     
     system_prompt = (
-        "Tu es un expert en trading crypto et un ami sympa. "
-        "Réponds de manière concise, directe et en français. "
-        f"\nUtilisateur : {message.text}"
+        "Tu es un expert en trading crypto. "
+        "Réponds en français de manière courte et efficace. "
+        f"\nQuestion : {message.text}"
     )
     
     reply = ask_ai(system_prompt)
@@ -108,81 +115,61 @@ def analyze_market(manual_trigger=False, chat_target=None):
     current_price = closes[-1]
     
     prompt = f"""
-    Agis comme un analyste pro. Analyse ces clôtures BTC (15m): {closes[-5:]}.
+    Agis comme un analyste financier. Voici les derniers prix BTC (15m): {closes}.
     Prix actuel: {current_price}.
     
-    Donne-moi UNIQUEMENT ce JSON strict, sans texte avant ou après :
+    Réponds uniquement avec ce JSON strict :
     {{
         "action": "ACHAT", "VENTE" ou "ATTENTE",
         "conf": 85,
-        "raison": "Une phrase courte."
+        "raison": "Une phrase courte expliquant pourquoi."
     }}
     """
     
     raw_res = ask_ai(prompt)
     if not raw_res: return
 
-    # Nettoyage de la réponse (pour extraire le JSON)
     clean_res = raw_res.replace('```json', '').replace('```', '').strip()
 
     try:
         signal = json.loads(clean_res)
-        
-        # Envoi du message formaté
         emoji = "🟢" if "ACHAT" in signal['action'] else "🔴" if "VENTE" in signal['action'] else "🟡"
+        
         msg = (
-            f"{emoji} **RÉSULTAT : {signal['action']}**\n\n"
-            f"💵 Prix : `{current_price}$`\n"
+            f"{emoji} **CONSEIL : {signal['action']}**\n\n"
+            f"💵 Prix : `{current_price:,} $`\n"
             f"🧠 Confiance : `{signal['conf']}%`\n"
             f"💡 *{signal['raison']}*"
         )
         bot.send_message(target_id, msg, parse_mode="Markdown")
             
-    except Exception as e:
-        print(f"Erreur Parsing JSON: {e}", flush=True)
+    except Exception:
         if manual_trigger: 
-            bot.send_message(target_id, f"Réponse brute de l'IA :\n{raw_res}")
+            bot.send_message(target_id, f"Analyse : {raw_res}")
 
-# --- BOUCLES DE LANCEMENT ---
+# --- LANCEMENT ---
 
 @app.route('/')
-def home(): 
-    return "Le bot crypto est en ligne !"
+def home(): return "Bot en ligne et synchronisé."
 
 def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 def run_auto_loop():
-    """Analyse automatique toutes les 10 minutes."""
     while True:
         try:
             analyze_market()
             time.sleep(600)
-        except Exception as e:
-            print(f"Erreur loop: {e}")
-            time.sleep(60)
+        except: time.sleep(60)
 
 def run_bot_safe():
-    """Lancement du bot avec sécurité contre les déconnexions."""
     while True:
         try:
-            print("🎧 Bot prêt et à l'écoute...", flush=True)
             bot.remove_webhook()
-            bot.infinity_polling(timeout=20, long_polling_timeout=5)
-        except Exception as e:
-            print(f"Erreur Polling: {e}")
-            time.sleep(5)
+            bot.infinity_polling(timeout=20)
+        except: time.sleep(5)
 
 if __name__ == "__main__":
-    # Thread 1: Analyse auto
-    t1 = threading.Thread(target=run_auto_loop, daemon=True)
-    t1.start()
-    
-    # Thread 2: Bot Telegram
-    t2 = threading.Thread(target=run_bot_safe, daemon=True)
-    t2.start()
-    
-    # Principal: Serveur Flask pour Render
+    threading.Thread(target=run_auto_loop, daemon=True).start()
+    threading.Thread(target=run_bot_safe, daemon=True).start()
     run_flask()
-
