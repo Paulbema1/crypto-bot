@@ -3,4 +3,5 @@ requests
 gunicorn
 pyTelegramBotAPI
 groq
-
+pandas
+numpy
