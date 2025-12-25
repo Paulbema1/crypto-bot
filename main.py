@@ -5,171 +5,248 @@ import requests
 import json
 import telebot
 import sys
+import pandas as pd
+import numpy as np
 from groq import Groq
 from flask import Flask
 
 # --- CONFIGURATION SYSTÈME ---
 sys.stdout.reconfigure(encoding='utf-8')
 
-# --- VARIABLES D'ENVIRONNEMENT (À configurer sur Render) ---
+# --- VARIABLES D'ENVIRONNEMENT ---
 GROQ_API_KEY = os.environ.get('GROQ_API_KEY')
 TG_TOKEN = os.environ.get('TG_TOKEN')
 TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
-# Modèle par défaut (Llama 3.3 est le plus stable actuellement)
 MODEL_NAME = os.environ.get('MODEL_NAME', 'llama-3.3-70b-versatile')
 
-# Initialisation Groq
 client = Groq(api_key=GROQ_API_KEY)
-
-# Initialisation Flask & Telegram
 app = Flask(__name__)
 bot = telebot.TeleBot(TG_TOKEN)
 
-# --- OUTILS DE RÉCUPÉRATION DE PRIX ---
+# --- MOTEUR D'ANALYSE TECHNIQUE (LE CERVEAU MATHÉMATIQUE) ---
 
-def get_btc_data():
-    """Récupère le prix SPOT réel du Bitcoin sur Binance."""
+def get_binance_data(symbol="BTCUSDT", interval="15m", limit=100):
+    """Récupère les données historiques pour calculer les indicateurs."""
     try:
-        # 1. On récupère le prix exact à la seconde près
-        price_url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-        price_resp = requests.get(price_url, timeout=10).json()
-        current_price = float(price_resp['price'])
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+        resp = requests.get(url, timeout=10).json()
         
-        # 2. On récupère l'historique récent pour l'analyse
-        klines_url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=15m&limit=10"
-        klines_resp = requests.get(klines_url, timeout=10).json()
-        closes = [float(c[4]) for c in klines_resp]
+        # Création du DataFrame (Tableau de données)
+        df = pd.DataFrame(resp, columns=['time', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'qav', 'num_trades', 'taker_base', 'taker_quote', 'ignore'])
         
-        # On remplace la dernière clôture par le prix exact en direct
-        closes[-1] = current_price
+        # Conversion en nombres décimaux
+        cols = ['open', 'high', 'low', 'close', 'volume']
+        df[cols] = df[cols].astype(float)
         
-        print(f"DEBUG: Prix BTC récupéré : {current_price}", flush=True)
-        return closes
+        return df
     except Exception as e:
-        print(f"Erreur Binance: {e}", flush=True)
+        print(f"Erreur Data: {e}")
         return None
 
-def ask_ai(prompt):
-    """Envoie une requête à Groq."""
-    try:
-        chat_completion = client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model=MODEL_NAME,
-        )
-        return chat_completion.choices[0].message.content
-    except Exception as e:
-        print(f"Erreur Groq ({MODEL_NAME}): {e}", flush=True)
-        return "Désolé, une erreur est survenue avec l'IA."
+def calculate_indicators(df):
+    """Calcule RSI, EMA, ATR pour la stratégie SMC."""
+    # 1. RSI (14) - Pour savoir si c'est suracheté/survendu
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
 
-# --- COMMANDES TELEGRAM ---
+    # 2. EMA 200 - La Tendance de Fond (SMC: On suit la tendance)
+    df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+    
+    # 3. EMA 50 - Tendance court terme
+    df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
 
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    welcome_msg = (
-        "👋 **Bot Assistant Crypto Connecté !**\n\n"
-        "💰 /prix - Voir le prix réel (Binance Spot)\n"
-        "🧠 /analyse - Analyse technique (Llama 3.3)\n"
-        "💬 *Pose-moi n'importe quelle question sur le trading.*"
-    )
-    bot.reply_to(message, welcome_msg, parse_mode="Markdown")
+    # 4. ATR (Average True Range) - Pour calculer TP et SL précis
+    high_low = df['high'] - df['low']
+    high_close = np.abs(df['high'] - df['close'].shift())
+    low_close = np.abs(df['low'] - df['close'].shift())
+    ranges = pd.concat([high_low, high_close, low_close], axis=1)
+    true_range = np.max(ranges, axis=1)
+    df['atr'] = true_range.rolling(14).mean()
 
-@bot.message_handler(commands=['prix'])
-def send_price(message):
-    data = get_btc_data()
-    if data:
-        price = data[-1]
-        bot.reply_to(message, f"💰 **Bitcoin (BTC)** : `{price:,} $`", parse_mode="Markdown")
+    return df
+
+def smc_strategy_logic(df):
+    """Détermine la direction et les niveaux clés (Python Logic)."""
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # Tendance
+    trend = "HAUSSIER" if last['close'] > last['ema200'] else "BAISSIER"
+    
+    # Logique de pré-signal (Filtre mathématique)
+    signal = "NEUTRE"
+    
+    # Condition ACHAT (LONG) : Tendance Hausse + RSI bas + Rebond
+    if trend == "HAUSSIER" and last['rsi'] < 45:
+        signal = "LONG"
+    
+    # Condition VENTE (SHORT) : Tendance Baisse + RSI haut + Rejet
+    elif trend == "BAISSIER" and last['rsi'] > 55:
+        signal = "SHORT"
+
+    # Calcul SL / TP (Ratio 1:2 minimum)
+    # On utilise l'ATR pour adapter le SL à la volatilité du moment
+    atr = last['atr']
+    price = last['close']
+    
+    if signal == "LONG":
+        sl_price = price - (atr * 1.5) # SL sous le dernier mouvement
+        tp_price = price + (atr * 3.0) # TP vise 2x le risque
+    elif signal == "SHORT":
+        sl_price = price + (atr * 1.5)
+        tp_price = price - (atr * 3.0)
     else:
-        bot.reply_to(message, "❌ Erreur de connexion Binance.")
+        sl_price = 0
+        tp_price = 0
+        
+    return {
+        "price": price,
+        "signal": signal,
+        "trend": trend,
+        "rsi": round(last['rsi'], 2),
+        "atr": round(atr, 2),
+        "sl": round(sl_price, 2),
+        "tp": round(tp_price, 2)
+    }
 
-@bot.message_handler(commands=['analyse'])
-def force_analyze(message):
-    bot.send_chat_action(message.chat.id, 'typing')
-    bot.reply_to(message, "🧐 Analyse du marché en cours...")
-    analyze_market(manual_trigger=True, chat_target=message.chat.id)
+# --- INTELLIGENCE ARTIFICIELLE ---
 
-# --- CHAT LIBRE ---
+def ask_ai_validation(data):
+    """Demande à l'IA de valider le signal et donner un score."""
+    if data['signal'] == "NEUTRE":
+        return None
 
-@bot.message_handler(func=lambda message: True)
-def chat_with_ai(message):
-    bot.send_chat_action(message.chat.id, 'typing')
-    
-    system_prompt = (
-        "Tu es un expert en trading crypto. "
-        "Réponds en français de manière courte et efficace. "
-        f"\nQuestion : {message.text}"
-    )
-    
-    reply = ask_ai(system_prompt)
-    bot.reply_to(message, reply)
-
-# --- LOGIQUE D'ANALYSE ---
-
-def analyze_market(manual_trigger=False, chat_target=None):
-    target_id = chat_target if manual_trigger else TG_CHAT_ID
-    if not target_id: return
-
-    closes = get_btc_data()
-    if not closes: return
-
-    current_price = closes[-1]
-    
     prompt = f"""
-    Agis comme un analyste financier. Voici les derniers prix BTC (15m): {closes}.
-    Prix actuel: {current_price}.
+    Tu es un Expert Trader SMC (Smart Money Concepts).
+    Je te donne les données techniques calculées par mon algorithme.
     
-    Réponds uniquement avec ce JSON strict :
+    CONTEXTE DU MARCHÉ (BTC/USDT 15m):
+    - Prix Actuel: {data['price']} $
+    - Tendance de fond (EMA200): {data['trend']}
+    - RSI (Momentum): {data['rsi']}
+    - Signal Technique suggéré: {data['signal']}
+    
+    TA MISSION:
+    Agis comme un Sniper. Sois très strict.
+    Estime un score de confiance de 0 à 100.
+    Si le RSI est contradictoire avec la tendance, baisse le score.
+    
+    Réponds UNIQUEMENT avec ce JSON :
     {{
-        "action": "ACHAT", "VENTE" ou "ATTENTE",
-        "conf": 85,
-        "raison": "Une phrase courte expliquant pourquoi."
+        "score": 85,
+        "raison_courte": "Structure haussière validée par RSI faible."
     }}
     """
     
-    raw_res = ask_ai(prompt)
-    if not raw_res: return
-
-    clean_res = raw_res.replace('```json', '').replace('```', '').strip()
-
     try:
-        signal = json.loads(clean_res)
-        emoji = "🟢" if "ACHAT" in signal['action'] else "🔴" if "VENTE" in signal['action'] else "🟡"
-        
-        msg = (
-            f"{emoji} **CONSEIL : {signal['action']}**\n\n"
-            f"💵 Prix : `{current_price:,} $`\n"
-            f"🧠 Confiance : `{signal['conf']}%`\n"
-            f"💡 *{signal['raison']}*"
+        completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model=MODEL_NAME
         )
-        bot.send_message(target_id, msg, parse_mode="Markdown")
-            
-    except Exception:
-        if manual_trigger: 
-            bot.send_message(target_id, f"Analyse : {raw_res}")
+        content = completion.choices[0].message.content
+        clean_json = content.replace('```json', '').replace('```', '').strip()
+        return json.loads(clean_json)
+    except Exception as e:
+        print(f"Erreur IA: {e}")
+        return {"score": 50, "raison_courte": "Analyse IA indisponible."}
 
-# --- LANCEMENT ---
+# --- COMMANDES BOT ---
 
+@bot.message_handler(commands=['analyse'])
+def manual_analyze(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    analyze_market(manual_trigger=True, chat_id=message.chat.id)
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.reply_to(message, "🤖 **Bot Sniper SMC Actif.**\nJe scanne le marché en silence...\n/analyse pour forcer un scan.")
+
+# --- COEUR DU SYSTÈME ---
+
+def analyze_market(manual_trigger=False, chat_id=TG_CHAT_ID):
+    if not chat_id: return
+
+    # 1. Récupération Data
+    df = get_binance_data()
+    if df is None: return
+
+    # 2. Calculs Maths
+    df = calculate_indicators(df)
+    
+    # 3. Stratégie SMC Python
+    data = smc_strategy_logic(df)
+    
+    # Si pas de signal technique et pas forcé manuellement -> On arrête
+    if data['signal'] == "NEUTRE" and not manual_trigger:
+        return
+
+    # 4. Validation IA
+    ai_verdict = ask_ai_validation(data)
+    if not ai_verdict:
+        if manual_trigger: bot.send_message(chat_id, "🥱 Marché neutre. Pas de setup SMC clair.")
+        return
+
+    score = ai_verdict['score']
+    reason = ai_verdict['raison_courte']
+
+    # FILTRE SNIPER : On envoie seulement si Score > 75 (ou si forcé)
+    if score < 75 and not manual_trigger:
+        return 
+
+    # 5. Formatage du Message PRO
+    # Calcul des pourcentages pour affichage
+    entry = data['price']
+    tp = data['tp']
+    sl = data['sl']
+    
+    tp_pct = round(((tp - entry) / entry) * 100, 2)
+    sl_pct = round(((sl - entry) / entry) * 100, 2)
+    
+    # Emojis dynamiques
+    if data['signal'] == "LONG":
+        header = "🟢 SIGNAL LONG DÉTECTÉ (ACHAT)"
+        color = "🟩"
+    else:
+        header = "🔴 SIGNAL SHORT DÉTECTÉ (VENTE)"
+        color = "🟥"
+        
+    msg = (
+        f"{header}\n\n"
+        f"💰 Prix Entrée: ${entry:,}\n"
+        f"🟩 TP: ${tp:,} ({tp_pct}%)\n"
+        f"🟥 SL: ${sl:,} ({sl_pct}%)\n\n"
+        f"🎯 Score Sniper: {score}/100\n"
+        f"🤖 IA: {reason}\n"
+        f"📉 RSI: {data['rsi']} | Tendance: {data['trend']}"
+    )
+    
+    bot.send_message(chat_id, msg)
+
+# --- SERVEUR WEB (POUR RENDER) ---
 @app.route('/')
-def home(): return "Bot en ligne et synchronisé."
+def home(): return "Sniper Bot Online"
 
 def run_flask():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
 
 def run_auto_loop():
+    """Boucle infinie qui analyse toutes les 15 minutes"""
     while True:
         try:
             analyze_market()
-            time.sleep(600)
-        except: time.sleep(60)
+            # On attend 15 minutes (900 sec) pour la prochaine bougie
+            time.sleep(900) 
+        except Exception as e:
+            print(f"Erreur Loop: {e}")
+            time.sleep(60)
 
-def run_bot_safe():
-    while True:
-        try:
-            bot.remove_webhook()
-            bot.infinity_polling(timeout=20)
-        except: time.sleep(5)
+def run_bot():
+    bot.infinity_polling()
 
 if __name__ == "__main__":
     threading.Thread(target=run_auto_loop, daemon=True).start()
-    threading.Thread(target=run_bot_safe, daemon=True).start()
-    run_flask()
+    threading.Thread(target=run_flask, daemon=True).start()
+    run_bot()
