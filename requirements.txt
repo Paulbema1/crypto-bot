@@ -1,5 +1,5 @@
 # Bot Trading Sniper - Dépendances
-# Python 3.10+ requis
+# Python 3.11 requis
 
 # Serveur Web
 flask==3.0.3
@@ -14,6 +14,6 @@ requests==2.32.3
 # IA Groq (LLaMA)
 groq==0.9.0
 
-# Data Science
+# Data Science (versions compatibles Python 3.11)
 pandas==2.2.2
 numpy==1.26.4
