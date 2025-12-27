@@ -1,7 +1,19 @@
-flask
-requests
-gunicorn
-pyTelegramBotAPI
-groq
-pandas
-numpy
+# Bot Trading Sniper - Dépendances
+# Python 3.10+ requis
+
+# Serveur Web
+flask==3.0.3
+gunicorn==21.2.0
+
+# Telegram Bot
+pyTelegramBotAPI==4.18.0
+
+# Requêtes HTTP
+requests==2.32.3
+
+# IA Groq (LLaMA)
+groq==0.9.0
+
+# Data Science
+pandas==2.2.2
+numpy==1.26.4
