@@ -11,9 +11,9 @@ pyTelegramBotAPI==4.18.0
 # Requêtes HTTP
 requests==2.32.3
 
-# IA Groq (LLaMA)
-groq==0.9.0
+# IA Groq (LLaMA) - VERSION MISE À JOUR
+groq==0.11.0
 
-# Data Science (versions compatibles Python 3.11)
+# Data Science
 pandas==2.2.2
 numpy==1.26.4
