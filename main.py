@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import threading
+import datetime
 import requests
 import json
 import telebot
@@ -38,20 +39,6 @@ if not all([GROQ_API_KEY, TG_TOKEN, TG_CHAT_ID]):
 client = Groq(api_key=GROQ_API_KEY)
 app = Flask(__name__)
 bot = telebot.TeleBot(TG_TOKEN)
-
-# --- MÉMOIRE DE CONVERSATION ---
-history_lock = Lock()
-user_histories = {}
-
-def update_history(user_id, role, content):
-    with history_lock:
-        if user_id not in user_histories:
-            user_histories[user_id] = deque(maxlen=10)
-        user_histories[user_id].append({"role": role, "content": content})
-
-def get_history(user_id):
-    with history_lock:
-        return list(user_histories.get(user_id, []))
 
 # --- MOTEUR D'ANALYSE TECHNIQUE ---
 
@@ -173,7 +160,7 @@ def sniper_logic(df):
         "vol_ok": is_volume_ok
     }
 
-# --- IA : VALIDATION & CHAT ---
+# --- IA : VALIDATION UNIQUEMENT ---
 
 def safe_string(text):
     """Convertit le texte en string safe pour l'encodage."""
@@ -236,44 +223,24 @@ def ask_ai_validation(data):
         print(f"Erreur validation IA: {e}")
         return None
 
-def chat_with_ai(user_id, message):
-    """Discussion naturelle avec memoire."""
-    history = get_history(user_id)
-    
-    system_prompt = {
-        "role": "system", 
-        "content": "Tu es un assistant Trading Crypto expert. Tu es concis, precis et pedagogue. Tu parles francais."
-    }
-    
-    messages = [system_prompt] + history + [{"role": "user", "content": safe_string(message)}]
-    
-    try:
-        response = client.chat.completions.create(
-            messages=messages, 
-            model=MODEL_NAME,
-            temperature=0.7
-        )
-        reply = safe_string(response.choices[0].message.content)
-        
-        update_history(user_id, "user", safe_string(message))
-        update_history(user_id, "assistant", reply)
-        
-        return reply
-    except Exception as e:
-        error_msg = safe_string(str(e))
-        print(f"Erreur Chat IA: {error_msg}")
-        return f"Erreur IA: {error_msg}"
-
-# --- HANDLERS TELEGRAM ---
+# --- HANDLERS TELEGRAM (SANS CHAT) ---
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    msg = "Bot Sniper Connecte!\n\nCommandes:\n- /analyse - Forcer une analyse\n- /status - Voir le status\n- Message libre - Discuter avec l'IA\n\nJe surveille le BTC automatiquement."
+    msg = (
+        "Bot Sniper Connecte!\n\n"
+        "Commandes disponibles:\n"
+        "/analyse - Forcer une analyse maintenant\n"
+        "/status - Voir le status actuel\n\n"
+        "Je surveille le BTC automatiquement toutes les 25 minutes.\n"
+        "Tu recevras un rapport a chaque analyse."
+    )
     bot.reply_to(message, msg)
 
 @bot.message_handler(commands=['analyse'])
 def force_analyze(message):
     bot.send_chat_action(message.chat.id, 'typing')
+    bot.reply_to(message, "Analyse en cours...")
     analyze_market(manual_trigger=True, chat_id=message.chat.id)
 
 @bot.message_handler(commands=['status'])
@@ -283,14 +250,15 @@ def send_status(message):
         if df is not None:
             df = calculate_indicators(df)
             last = df.iloc[-1]
+            now = datetime.datetime.now().strftime("%H:%M:%S")
             msg = (
-                f"Status Bot\n\n"
+                f"[{now}] Status Bot\n\n"
                 f"Prix BTC: ${last['close']:,.2f}\n"
                 f"RSI: {last['rsi']:.2f}\n"
                 f"ADX: {last['adx']:.2f}\n"
                 f"EMA200: ${last['ema200']:,.2f}\n"
                 f"ATR: ${last['atr']:.2f}\n"
-                f"Volume OK: {last['volume'] > last['vol_ma']}"
+                f"Volume OK: {'Oui' if last['volume'] > last['vol_ma'] else 'Non'}"
             )
             bot.reply_to(message, msg)
         else:
@@ -298,63 +266,73 @@ def send_status(message):
     except Exception as e:
         bot.reply_to(message, f"Erreur: {safe_string(str(e))}")
 
-@bot.message_handler(func=lambda message: True)
-def handle_chat(message):
-    """Gere le chat libre avec l'IA."""
-    bot.send_chat_action(message.chat.id, 'typing')
-    reply = chat_with_ai(message.from_user.id, message.text)
-    bot.reply_to(message, reply)
-
-# --- LOGIQUE PRINCIPALE ---
+# --- LOGIQUE PRINCIPALE (RAPPORT TOUTES LES 25 MIN) ---
 
 def analyze_market(manual_trigger=False, chat_id=None):
-    """Analyse le marche et envoie un signal si pertinent."""
+    """Analyse le marche et envoie TOUJOURS un rapport."""
     
     target_chat = chat_id or TG_CHAT_ID
     if not target_chat: 
         print("Pas de chat_id configure")
         return
 
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    
     df = get_binance_data()
     if df is None: 
-        if manual_trigger:
-            bot.send_message(target_chat, "Erreur recuperation donnees Binance")
+        msg = f"[{now}] Erreur recuperation donnees Binance\nProchaine analyse dans 25 min"
+        bot.send_message(target_chat, msg)
         return
 
     df = calculate_indicators(df)
     data = sniper_logic(df)
     
+    # PAS DE SIGNAL
     if data['signal'] == "NEUTRE":
-        if manual_trigger:
-            msg = (
-                f"Pas de signal actuellement\n\n"
-                f"Prix: ${data['price']:,.2f}\n"
-                f"Tendance: {data['trend']}\n"
-                f"RSI: {data['rsi']} | ADX: {data['adx']}\n"
-                f"Volume OK: {'Oui' if data['vol_ok'] else 'Non'}"
-            )
-            bot.send_message(target_chat, msg)
+        msg = (
+            f"[{now}] Analyse terminee\n\n"
+            f"Prix BTC: ${data['price']:,.2f}\n"
+            f"Tendance: {data['trend']}\n"
+            f"RSI: {data['rsi']} | ADX: {data['adx']}\n"
+            f"Volume OK: {'Oui' if data['vol_ok'] else 'Non'}\n\n"
+            f"Signal: AUCUN - En attente...\n"
+            f"Prochaine analyse dans 25 min"
+        )
+        bot.send_message(target_chat, msg)
+        print(f"[{now}] Analyse envoyee - Pas de signal")
         return
 
+    # SIGNAL DETECTE - Validation IA
     ai_verdict = ask_ai_validation(data)
     if not ai_verdict: 
-        if manual_trigger: 
-            bot.send_message(target_chat, "Erreur IA, pas de validation possible.")
+        msg = (
+            f"[{now}] Analyse terminee\n\n"
+            f"Prix BTC: ${data['price']:,.2f}\n"
+            f"Signal detecte: {data['signal']}\n"
+            f"Erreur IA - pas de validation\n\n"
+            f"Prochaine analyse dans 25 min"
+        )
+        bot.send_message(target_chat, msg)
         return
 
     score = ai_verdict['score']
     
+    # SIGNAL MAIS SCORE FAIBLE
     if score < 75:
-        if manual_trigger:
-            msg = (
-                f"Signal detecte mais score trop faible\n\n"
-                f"Signal: {data['signal']}\n"
-                f"Score: {score}/100 (minimum: 75)\n"
-                f"Raison: {ai_verdict['raison']}"
-            )
-            bot.send_message(target_chat, msg)
+        msg = (
+            f"[{now}] Analyse terminee\n\n"
+            f"Prix BTC: ${data['price']:,.2f}\n"
+            f"Signal detecte: {data['signal']}\n"
+            f"Score IA: {score}/100 (minimum: 75)\n"
+            f"Raison: {ai_verdict['raison']}\n\n"
+            f"Action: ATTENDRE\n"
+            f"Prochaine analyse dans 25 min"
+        )
+        bot.send_message(target_chat, msg)
+        print(f"[{now}] Signal {data['signal']} - Score faible: {score}")
         return
 
+    # VRAI SIGNAL VALIDE !
     entry = data['price']
     
     if entry > 0:
@@ -363,21 +341,21 @@ def analyze_market(manual_trigger=False, chat_id=None):
     else:
         tp_pct, sl_pct = 0, 0
     
-    emoji = "LONG" if data['signal'] == "LONG" else "SHORT"
-    
     msg = (
-        f"SIGNAL {emoji} SNIPER\n\n"
+        f"[{now}] SIGNAL DETECTE !\n\n"
+        f"Type: {data['signal']}\n"
         f"Prix Entree: ${entry:,.2f}\n"
         f"TP: ${data['tp']:,.2f} ({tp_pct:+}%)\n"
         f"SL: ${data['sl']:,.2f} ({sl_pct:+}%)\n\n"
         f"Score IA: {score}/100\n"
         f"Analyse: {ai_verdict['raison']}\n\n"
         f"RSI: {data['rsi']} | ADX: {data['adx']}\n"
-        f"Tendance: {data['trend']} | Vol: {'Oui' if data['vol_ok'] else 'Non'}"
+        f"Tendance: {data['trend']}\n\n"
+        f"Prochaine analyse dans 25 min"
     )
     
     bot.send_message(target_chat, msg)
-    print(f"Signal {data['signal']} envoye - Score: {score}")
+    print(f"[{now}] SIGNAL {data['signal']} envoye - Score: {score}")
 
 # --- LANCEMENT ---
 
@@ -390,16 +368,26 @@ def health():
     return {"status": "healthy", "bot": "running"}
 
 def run_loop():
-    print("Boucle d'analyse demarree (intervalle: 15min)")
+    """Boucle d'analyse toutes les 25 minutes."""
+    print("Boucle d'analyse demarree (intervalle: 25 min)")
+    
+    # Message de demarrage
+    try:
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        bot.send_message(TG_CHAT_ID, f"[{now}] Bot demarre !\n\nPremiere analyse en cours...")
+    except Exception as e:
+        print(f"Erreur message demarrage: {e}")
+    
     while True:
         try:
             analyze_market()
-            time.sleep(900)
+            time.sleep(1500)  # 25 minutes = 1500 secondes
         except Exception as e:
             print(f"Erreur boucle: {safe_string(str(e))}")
             time.sleep(60)
 
 def run_bot():
+    """Lance le bot Telegram."""
     print("Bot Telegram demarre")
     while True:
         try:
